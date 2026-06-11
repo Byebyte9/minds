@@ -1,0 +1,347 @@
+import 'dotenv/config';
+import express       from 'express';
+import fs             from 'fs';
+import path           from 'path';
+import crypto         from 'crypto';
+import { fileURLToPath } from 'url';
+import Groq           from 'groq-sdk';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app  = express();
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+app.use(express.json());
+
+// CORS — permite GitHub Pages (e qualquer origem em dev)
+app.use((req, res, next) => {
+  const allowed = process.env.ALLOWED_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', allowed);
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ─────────────────────────────────────────
+//  PATHS
+// ─────────────────────────────────────────
+const USERS_DIR = path.join(__dirname, 'users');
+
+fs.mkdirSync(USERS_DIR, { recursive: true });
+
+// ─────────────────────────────────────────
+//  HELPERS DE ARQUIVO
+// ─────────────────────────────────────────
+function userDir(userId) {
+  return path.join(USERS_DIR, userId);
+}
+
+function readJSON(filePath, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJSON(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+// ─────────────────────────────────────────
+//  AUTH — código por email (sem envio real)
+// ─────────────────────────────────────────
+
+// Guarda códigos temporários em memória: { email → { code, expiresAt, mode } }
+const pendingCodes = new Map();
+
+// Lê todos os usuários
+function getUsers() {
+  return readJSON(path.join(USERS_DIR, 'users.json'), []);
+}
+function saveUsers(users) {
+  writeJSON(path.join(USERS_DIR, 'users.json'), users);
+}
+function findUserByEmail(email) {
+  return getUsers().find(u => u.email === email) || null;
+}
+function findUserById(id) {
+  return getUsers().find(u => u.id === id) || null;
+}
+
+// Sessões simples em memória: { token → userId }
+const sessions = new Map();
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, userId);
+  return token;
+}
+function getSession(req) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace('Bearer ', '').trim();
+  return sessions.get(token) || null;
+}
+function requireAuth(req, res, next) {
+  const userId = getSession(req);
+  if (!userId) return res.status(401).json({ error: 'não autenticado' });
+  const user = findUserById(userId);
+  if (!user) return res.status(401).json({ error: 'usuário não encontrado' });
+  req.user = user;
+  next();
+}
+
+// POST /auth/send-code
+app.post('/auth/send-code', (req, res) => {
+  const { email, mode } = req.body;
+  console.log(`[send-code] email=${email} mode=${mode}`);
+  if (!email) return res.status(400).json({ error: 'email obrigatório' });
+
+  const userExists = !!findUserByEmail(email);
+  console.log(`[send-code] userExists=${userExists}`);
+
+  if (mode === 'login' && !userExists)
+    return res.status(404).json({ error: 'email não cadastrado' });
+  if (mode === 'register' && userExists)
+    return res.status(409).json({ error: 'email já cadastrado' });
+
+  const code      = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  pendingCodes.set(email, { code, expiresAt, mode });
+
+  console.log(`\n🔑 CÓDIGO PARA ${email}: ${code}\n`);
+
+  res.json({ ok: true });
+});
+
+// POST /auth/check-code  (valida sem consumir — usado no registro antes de ir pro username)
+app.post('/auth/check-code', (req, res) => {
+  const { email, code } = req.body;
+  const pending = pendingCodes.get(email);
+  if (!pending)                     return res.status(400).json({ error: 'nenhum código pendente' });
+  if (Date.now() > pending.expiresAt) { pendingCodes.delete(email); return res.status(400).json({ error: 'código expirado' }); }
+  if (pending.code !== String(code))  return res.status(400).json({ error: 'código incorreto' });
+  res.json({ ok: true });
+});
+
+// POST /auth/verify-code
+app.post('/auth/verify-code', (req, res) => {
+  const { email, code, username } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'campos obrigatórios' });
+
+  const pending = pendingCodes.get(email);
+  if (!pending)           return res.status(400).json({ error: 'nenhum código pendente' });
+  if (Date.now() > pending.expiresAt) {
+    pendingCodes.delete(email);
+    return res.status(400).json({ error: 'código expirado' });
+  }
+  if (pending.code !== String(code))  return res.status(400).json({ error: 'código incorreto' });
+
+  pendingCodes.delete(email);
+
+  let user = findUserByEmail(email);
+
+  if (pending.mode === 'register') {
+    if (!username) return res.status(400).json({ error: 'username obrigatório no cadastro' });
+    user = {
+      id:        crypto.randomUUID(),
+      email,
+      username,
+      photo:     null,
+      criadoEm: new Date().toISOString(),
+    };
+    const users = getUsers();
+    users.push(user);
+    saveUsers(users);
+    fs.mkdirSync(userDir(user.id), { recursive: true });
+    writeJSON(path.join(userDir(user.id), 'conversations.json'), []);
+  }
+
+  const token = createSession(user.id);
+  res.json({ ok: true, token, user: { id: user.id, username: user.username, photo: user.photo } });
+});
+
+// POST /auth/logout
+app.post('/auth/logout', requireAuth, (req, res) => {
+  const auth  = req.headers['authorization'] || '';
+  const token = auth.replace('Bearer ', '').trim();
+  sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────
+//  PERFIL
+// ─────────────────────────────────────────
+
+// GET /me
+app.get('/me', requireAuth, (req, res) => {
+  const { id, username, email, photo } = req.user;
+  res.json({ id, username, email, photo });
+});
+
+// PUT /me
+app.put('/me', requireAuth, (req, res) => {
+  const { username, photo } = req.body;
+  const users = getUsers();
+  const idx   = users.findIndex(u => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error: 'usuário não encontrado' });
+  if (username) users[idx].username = username;
+  if (photo !== undefined) users[idx].photo = photo; // base64 ou null
+  saveUsers(users);
+  res.json({ ok: true, user: users[idx] });
+});
+
+// ─────────────────────────────────────────
+//  CONVERSAS
+// ─────────────────────────────────────────
+function getConvFile(userId) {
+  return path.join(userDir(userId), 'conversations.json');
+}
+function getConvs(userId) {
+  return readJSON(getConvFile(userId), []);
+}
+function saveConvs(userId, convs) {
+  writeJSON(getConvFile(userId), convs);
+}
+
+// GET /conversations
+app.get('/conversations', requireAuth, (req, res) => {
+  const convs = getConvs(req.user.id).map(({ id, titulo, atualizadoEm, messages }) => ({
+    id, titulo, atualizadoEm,
+    preview: messages.at(-1)?.text?.slice(0, 40) || '',
+  }));
+  res.json(convs);
+});
+
+// POST /conversations
+app.post('/conversations', requireAuth, (req, res) => {
+  const { titulo } = req.body;
+  const conv = {
+    id:           crypto.randomUUID(),
+    titulo:       titulo || 'Nova conversa',
+    criadoEm:    new Date().toISOString(),
+    atualizadoEm: new Date().toISOString(),
+    messages:     [],
+  };
+  const convs = getConvs(req.user.id);
+  convs.unshift(conv);
+  saveConvs(req.user.id, convs);
+  res.json(conv);
+});
+
+// GET /conversations/:id/messages
+app.get('/conversations/:id/messages', requireAuth, (req, res) => {
+  const conv = getConvs(req.user.id).find(c => c.id === req.params.id);
+  if (!conv) return res.status(404).json({ error: 'conversa não encontrada' });
+  res.json({ messages: conv.messages });
+});
+
+// PUT /conversations/:id  (renomear)
+app.put('/conversations/:id', requireAuth, (req, res) => {
+  const convs = getConvs(req.user.id);
+  const conv  = convs.find(c => c.id === req.params.id);
+  if (!conv) return res.status(404).json({ error: 'conversa não encontrada' });
+  if (req.body.titulo) conv.titulo = req.body.titulo;
+  saveConvs(req.user.id, convs);
+  res.json({ ok: true });
+});
+
+// DELETE /conversations/:id
+app.delete('/conversations/:id', requireAuth, (req, res) => {
+  let convs = getConvs(req.user.id);
+  const antes = convs.length;
+  convs = convs.filter(c => c.id !== req.params.id);
+  if (convs.length === antes) return res.status(404).json({ error: 'conversa não encontrada' });
+  saveConvs(req.user.id, convs);
+  res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────
+//  CHAT COM STREAMING (SSE)
+// ─────────────────────────────────────────
+
+// POST /conversations/:id/chat
+// Body: { messages: [{role, text}] }  ← histórico completo + msg nova
+app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
+  const convs = getConvs(req.user.id);
+  const conv  = convs.find(c => c.id === req.params.id);
+  if (!conv) return res.status(404).json({ error: 'conversa não encontrada' });
+
+  const { messages: clientMsgs } = req.body;
+  if (!clientMsgs?.length) return res.status(400).json({ error: 'messages obrigatório' });
+
+  // Monta histórico no formato Groq
+  const groqMsgs = [
+    {
+      role: 'system',
+      content: `Você é o Mind, um assistente pessoal próximo e empático. 
+Você se comunica de forma casual, direta e calorosa em português brasileiro. 
+Você conhece o usuário pelo nome: ${req.user.username}.
+Seja conciso — respostas curtas a médias, sem listas desnecessárias.`,
+    },
+    ...clientMsgs.map(m => ({
+      role:    m.role === 'mind' ? 'assistant' : 'user',
+      content: m.text,
+    })),
+  ];
+
+  // SSE headers
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  const send = (type, payload) =>
+    res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`);
+
+  try {
+    const stream = await groq.chat.completions.create({
+      model:       'llama-3.3-70b-versatile',
+      messages:    groqMsgs,
+      stream:      true,
+      max_tokens:  1024,
+      temperature: 0.85,
+    });
+
+    let fullText = '';
+
+    for await (const chunk of stream) {
+      // cliente desconectou (cancelou) — para a geração
+      if (res.writableEnded) break;
+
+      const delta = chunk.choices[0]?.delta?.content || '';
+      if (delta) {
+        fullText += delta;
+        send('delta', { text: delta });
+      }
+    }
+
+    // Salva a conversa só se o cliente não cancelou
+    if (!res.writableEnded && fullText) {
+      conv.messages    = clientMsgs;
+      conv.messages.push({ role: 'mind', text: fullText, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) });
+      conv.atualizadoEm = new Date().toISOString();
+      saveConvs(req.user.id, convs);
+      send('done', { text: fullText });
+    }
+
+    res.end();
+  } catch (err) {
+    console.error('Groq error:', err.message);
+    if (!res.writableEnded) {
+      send('error', { message: 'Erro ao gerar resposta' });
+      res.end();
+    }
+  }
+});
+
+
+
+// ─────────────────────────────────────────
+//  START
+// ─────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n🧠 Mind rodando em http://localhost:${PORT}\n`);
+});
