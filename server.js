@@ -24,13 +24,6 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY || ''
 );
 
-
-function nowTime(tz) {
-  return new Date().toLocaleTimeString('pt-BR', {
-    hour: '2-digit', minute: '2-digit',
-    timeZone: tz || 'America/Sao_Paulo'
-  });
-}
 app.use(express.json());
 
 // CORS
@@ -315,7 +308,7 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
       // Salva a resposta de confirmação na conversa e retorna
       conv.messages = [
         ...clientMsgs,
-        { role: 'mind', text: confirmação, time: nowTime(tz) },
+        { role: 'mind', text: confirmação, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) },
       ];
       conv.atualizadoEm = new Date().toISOString();
       saveConvs(req.user.id, convs);
@@ -354,7 +347,7 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
       // Salva conversa
       conv.messages = [
         ...clientMsgs,
-        { role: 'mind', text: fullText, time: nowTime(tz) },
+        { role: 'mind', text: fullText, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) },
       ];
       conv.atualizadoEm = new Date().toISOString();
       saveConvs(req.user.id, convs);
@@ -427,7 +420,7 @@ setInterval(async () => {
 
       // 2. Injeta a msg numa conversa
       const convs = getConvs(user.id);
-      const time  = nowTime();
+      const time  = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
       const mindMsg = { role: 'mind', text: msg, time, proactive: true };
 
       if (convs.length > 0) {
