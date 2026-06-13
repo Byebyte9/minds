@@ -1,10 +1,6 @@
 import { readMemories } from './memory.js';
 import { generate }     from './model.js';
 
-/**
- * Verifica memórias e decide se tem algo relevante pra notificar proativamente.
- * Roda periodicamente (a cada hora via setInterval no server.js)
- */
 export async function checkProactive(usersDir, userId, username) {
   const memories = readMemories(usersDir, userId);
   if (!memories.length) return null;
@@ -13,7 +9,6 @@ export async function checkProactive(usersDir, userId, username) {
   const today = now.toLocaleDateString('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' });
   const hora  = now.getHours();
   const turno = hora < 12 ? 'manhã' : hora < 18 ? 'tarde' : 'noite';
-
   const memList = memories.map(m => `- [${m.category}] ${m.content}`).join('\n');
 
   const prompt = `Você é o Mind, assistente pessoal de ${username}.
@@ -29,7 +24,7 @@ Se houver algo, escreva UMA mensagem curta e casual no estilo do Mind.
 Se não, responda exatamente: NULL`;
 
   try {
-    const res     = await generate([{ role: 'user', content: prompt }], { temperature: 0.7, max_tokens: 150 });
+    const res = await generate([{ role: 'user', content: prompt }], { temperature: 0.7, max_tokens: 150 });
     const trimmed = res.trim();
     return (trimmed === 'NULL' || !trimmed) ? null : trimmed;
   } catch (err) {
@@ -38,17 +33,19 @@ Se não, responda exatamente: NULL`;
   }
 }
 
-/**
- * Constrói o system prompt do Mind com memórias e localização do usuário.
- * @param {string} username
- * @param {string} memoriesContext   — saída de memoriesAsContext()
- * @param {object|null} location     — { label, lat, lng } ou null
- */
 export function buildSystemPrompt(username, memoriesContext, location = null) {
   const locationCtx = location
-    ? `\nLocalização atual de ${username}: ${location.label || 'desconhecida'} (lat ${location.lat}, lng ${location.lng}).
-Você pode usar isso pra sugerir restaurantes, clima, lugares próximos quando fizer sentido.\n`
+    ? `\nLocalização atual de ${username}: ${location.label || 'desconhecida'} (lat: ${location.lat}, lon: ${location.lon}).\n`
     : '';
+
+  const toolsCtx = `
+Ferramentas disponíveis — USE SEMPRE QUE NECESSÁRIO:
+- **web_search**: use pra qualquer pergunta sobre notícias, lançamentos, preços, eventos, tecnologia, pessoas, produtos — qualquer coisa que possa ter mudado. SEMPRE pesquise antes de dizer que não sabe.
+- **nearby_search**: use quando ${username} perguntar sobre lugares próximos (restaurantes, padarias, farmácias, mercados, etc).${location ? ` Você JÁ TEM as coordenadas (lat: ${location.lat}, lon: ${location.lon}) — use-as diretamente.` : ' Só disponível quando o usuário compartilha localização.'}
+
+NUNCA diga que não conseguiu encontrar algo sem tentar a ferramenta primeiro.
+NUNCA invente nomes de lugares ou produtos — pesquise sempre.
+`;
 
   return `Você é o Mind, o assistente pessoal de ${username}.
 
@@ -65,20 +62,6 @@ Formatação — SIGA SEMPRE:
 - Quando listar coisas, use • bullet points — nunca inline separado por vírgulas
 - Respostas curtas (1 parágrafo) pra perguntas simples, 2-3 parágrafos pra assuntos complexos
 - Frases curtas e diretas. Sem enrolação.
-
-Exemplo:
-❌ "Oi oi! Tudo bem? Quer conversar sobre algo específico ou só quer bater um papo?"
-✅ "Oi oi! 👋
-
-Tudo bem por aí?
-
-Quer falar sobre algo ou só bater um papo mesmo?"
-
-Capacidades:
-- Você lembra de tudo que ${username} te conta
-- Você é proativo — age por conta própria quando faz sentido
-- Você conecta pontos entre coisas ditas em momentos diferentes
-- Você sabe a localização do usuário quando ele compartilha, e usa isso pra ser mais útil
-${locationCtx}${memoriesContext}
+${locationCtx}${toolsCtx}${memoriesContext}
 Seja o Mind. Não explique que é uma IA a menos que diretamente perguntado.`;
 }
