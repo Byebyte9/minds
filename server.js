@@ -330,19 +330,40 @@ const NEARBY_TOOL = {
   },
 };
 
-async function nearbySearch(lat, lon, type, keyword = '', radius = 1000) {
+async function nearbySearch(lat, lon, type, keyword = '', radius = 1500) {
   try {
-    // Overpass API — busca no OpenStreetMap
-    const tag   = `amenity=${type}`;
-    const query = `[out:json][timeout:10];(node[${tag}](around:${radius},${lat},${lon});way[${tag}](around:${radius},${lat},${lon}););out center 8;`;
-    const res   = await fetch('https://overpass-api.de/api/interpreter', {
-      method:  'POST',
+    // tenta amenity primeiro, depois shop (padaria = shop=bakery no OSM)
+    const shopMap = { bakery: 'bakery', supermarket: 'supermarket', convenience: 'convenience' };
+    const isShop  = shopMap[type];
+    const tagA    = isShop ? `shop=${isShop}` : `amenity=${type}`;
+    const tagB    = `amenity=${type}`;
+
+    const buildQ = tag =>
+      `[out:json][timeout:15];(node[${tag}](around:${radius},${lat},${lon});way[${tag}](around:${radius},${lat},${lon}););out center 10;`;
+
+    console.log(`[nearby] lat=${lat} lon=${lon} type=${type} radius=${radius}`);
+
+    let data;
+    const res1 = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    `data=${encodeURIComponent(query)}`,
+      body: `data=${encodeURIComponent(buildQ(tagA))}`,
     });
-    const data = await res.json();
+    data = await res1.json();
+
+    // se não achou com a primeira tag, tenta a segunda
+    if (!data.elements?.length && isShop) {
+      const res2 = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `data=${encodeURIComponent(buildQ(tagB))}`,
+      });
+      data = await res2.json();
+    }
+
+    console.log(`[nearby] encontrou ${data.elements?.length || 0} resultados`);
     const elements = (data.elements || []).slice(0, 6);
-    if (!elements.length) return 'Nenhum lugar encontrado próximo.';
+    if (!elements.length) return `Não encontrei ${type} num raio de ${radius}m. O OpenStreetMap pode não ter mapeado essa área ainda.`;
 
     return elements.map(e => {
       const name = e.tags?.name || 'Sem nome';
@@ -353,6 +374,7 @@ async function nearbySearch(lat, lon, type, keyword = '', radius = 1000) {
       return `• ${name}${addr ? ' — ' + addr : ''}${mapsUrl ? '\n  ' + mapsUrl : ''}`;
     }).join('\n');
   } catch (e) {
+    console.error('[nearby] erro:', e.message);
     return 'Não consegui buscar lugares próximos agora.';
   }
 }
@@ -575,11 +597,13 @@ function haversine(lat1, lon1, lat2, lon2) {
 async function reverseGeocode(lat, lon) {
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=pt`;
+    console.log(`[geocode] ${url}`);
     const res  = await fetch(url, { headers: { 'User-Agent': 'MindApp/1.0' } });
     const data = await res.json();
+    console.log(`[geocode] resultado:`, JSON.stringify(data.address || data.error));
     const addr = data.address || {};
-    return addr.road || addr.suburb || addr.neighbourhood || addr.city || addr.town || 'lugar desconhecido';
-  } catch { return null; }
+    return addr.road || addr.suburb || addr.neighbourhood || addr.city_district || addr.city || addr.town || 'lugar desconhecido';
+  } catch (e) { console.error('[geocode] erro:', e.message); return null; }
 }
 
 // detecta o tipo do lugar atual baseado nos lugares salvos
@@ -599,6 +623,7 @@ function detectPlaceType(userId, lat, lon) {
 // POST /location — frontend manda coords a cada 5min
 app.post('/location', requireAuth, async (req, res) => {
   const { lat, lon, enabled } = req.body;
+  console.log(`[location] userId=${req.user.id} lat=${lat} lon=${lon} enabled=${enabled}`);
   const loc = readLoc(req.user.id);
 
   if (!enabled) {
