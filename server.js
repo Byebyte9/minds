@@ -455,7 +455,7 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
           resultText = 'Localização não disponível.';
         } else {
           send('status', { text: `📍 buscando ${args.keyword || args.type} próximo...` });
-          resultText = await nearbySearch(locCtx.lat, locCtx.lon, args.type, args.keyword, args.radius || 1000);
+          resultText = await nearbySearch(locCtx.lat, locCtx.lon, args.type, args.keyword || '', Number(args.radius) || 1500);
         }
       } else {
         // web_search
