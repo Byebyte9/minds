@@ -12,6 +12,7 @@ import { extractMemories, memoriesAsContext, readMemories }  from './core/memory
 import { buildSystemPrompt, checkProactive }                 from './core/agent.js';
 import { startCrawl, stopCrawl, isCrawling }                 from './crawler/crawler.js';
 import { initReminders, extractReminder }                    from './core/reminders.js';
+import { webSearch, formatSearchResults }                    from './core/search.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app       = express();
@@ -290,8 +291,28 @@ app.delete('/conversations/:id', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────
-//  CHAT COM STREAMING (SSE)
+//  CHAT COM STREAMING + WEB SEARCH
 // ─────────────────────────────────────────
+
+// Definição da ferramenta pra o Groq
+const SEARCH_TOOL = {
+  type: 'function',
+  function: {
+    name: 'web_search',
+    description: 'Busca informações atuais na web. Use quando precisar de dados recentes, fatos específicos, preços, notícias, ou qualquer coisa que possa ter mudado.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Termo de busca em português ou inglês',
+        },
+      },
+      required: ['query'],
+    },
+  },
+};
+
 app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
   const convs = getConvs(req.user.id);
   const conv  = convs.find(c => c.id === req.params.id);
@@ -300,12 +321,11 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
   const { messages: clientMsgs } = req.body;
   if (!clientMsgs?.length) return res.status(400).json({ error: 'messages obrigatório' });
 
-  // Verifica se é um pedido de lembrete — responde diretamente se for
+  // Verifica se é um pedido de lembrete
   const lastUserMsg = [...clientMsgs].reverse().find(m => m.role === 'user');
   if (lastUserMsg) {
     const confirmação = await extractReminder(req.user.id, req.user.username, lastUserMsg.text).catch(() => null);
     if (confirmação) {
-      // Salva a resposta de confirmação na conversa e retorna
       conv.messages = [
         ...clientMsgs,
         { role: 'mind', text: confirmação, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) },
@@ -316,7 +336,7 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
     }
   }
 
-  // Pega memórias do usuário e monta system prompt
+  // Monta system prompt com memórias
   const memCtx    = memoriesAsContext(USERS_DIR, req.user.id);
   const sysPrompt = buildSystemPrompt(req.user.username, memCtx);
 
@@ -338,26 +358,72 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
     res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`);
 
   try {
-    const fullText = await generateStream(
-      groqMsgs,
-      delta => { if (!res.writableEnded) send('delta', { text: delta }); }
-    );
+    // Primeira chamada — com tool disponível
+    const firstCall = await groq.chat.completions.create({
+      model:       'llama-3.3-70b-versatile',
+      messages:    groqMsgs,
+      tools:       [SEARCH_TOOL],
+      tool_choice: 'auto',
+      max_tokens:  1024,
+      temperature: 0.85,
+    });
 
-    if (!res.writableEnded && fullText) {
-      // Salva conversa
-      conv.messages = [
-        ...clientMsgs,
-        { role: 'mind', text: fullText, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) },
+    const firstChoice = firstCall.choices[0];
+
+    // Modelo quer usar a busca
+    if (firstChoice.finish_reason === 'tool_calls') {
+      const toolCall = firstChoice.message.tool_calls[0];
+      const { query } = JSON.parse(toolCall.function.arguments);
+
+      console.log(`[search] buscando: "${query}"`);
+      send('status', { text: `🔍 pesquisando "${query}"...` });
+
+      const results     = await webSearch(query);
+      const resultText  = formatSearchResults(results);
+
+      // Segunda chamada — com resultado da busca, agora em streaming
+      const msgsComBusca = [
+        ...groqMsgs,
+        firstChoice.message, // msg do assistant com tool_calls
+        {
+          role:         'tool',
+          tool_call_id: toolCall.id,
+          content:      resultText,
+        },
       ];
-      conv.atualizadoEm = new Date().toISOString();
-      saveConvs(req.user.id, convs);
-      send('done', { text: fullText });
 
-      // Extrai memórias da última mensagem do usuário (silencioso, não bloqueia)
-      const lastUserMsg = [...clientMsgs].reverse().find(m => m.role === 'user');
-      if (lastUserMsg) {
-        extractMemories(USERS_DIR, req.user.id, req.user.username, lastUserMsg.text)
-          .catch(e => console.error('[memory]', e.message));
+      const stream = await groq.chat.completions.create({
+        model:       'llama-3.3-70b-versatile',
+        messages:    msgsComBusca,
+        stream:      true,
+        max_tokens:  1024,
+        temperature: 0.85,
+      });
+
+      let fullText = '';
+      for await (const chunk of stream) {
+        if (res.writableEnded) break;
+        const delta = chunk.choices[0]?.delta?.content || '';
+        if (delta) { fullText += delta; send('delta', { text: delta }); }
+      }
+
+      if (!res.writableEnded && fullText) {
+        salvarEExtrair(conv, convs, clientMsgs, fullText, req.user, send);
+      }
+
+    } else {
+      // Modelo não quis buscar — stream normal da resposta já gerada
+      // (o texto já veio completo, só streamamos token a token pra manter UX)
+      const content = firstChoice.message?.content || '';
+      if (content) {
+        // simula streaming char a char em chunks de ~4 chars
+        const CHUNK = 4;
+        for (let i = 0; i < content.length; i += CHUNK) {
+          if (res.writableEnded) break;
+          send('delta', { text: content.slice(i, i + CHUNK) });
+          await new Promise(r => setTimeout(r, 8));
+        }
+        if (!res.writableEnded) salvarEExtrair(conv, convs, clientMsgs, content, req.user, send);
       }
     }
 
@@ -367,6 +433,27 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
     if (!res.writableEnded) { send('error', { message: 'Erro ao gerar resposta' }); res.end(); }
   }
 });
+
+function salvarEExtrair(conv, convs, clientMsgs, fullText, user, send) {
+  conv.messages = [
+    ...clientMsgs,
+    { role: 'mind', text: fullText, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) },
+  ];
+  conv.atualizadoEm = new Date().toISOString();
+  saveConvs(user.id, convs);
+  send('done', { text: fullText });
+
+  // extrai memórias silencioso
+  const lastUserIdx = [...clientMsgs].map((m,i) => m.role==='user'?i:-1).filter(i=>i>=0).at(-1);
+  if (lastUserIdx !== undefined) {
+    const snapshot = [
+      ...clientMsgs.slice(Math.max(0, lastUserIdx - 3), lastUserIdx + 1),
+      { role: 'mind', text: fullText, time: new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) },
+    ];
+    extractMemories(USERS_DIR, user.id, user.username, clientMsgs[lastUserIdx].text, snapshot)
+      .catch(e => console.error('[memory]', e.message));
+  }
+}
 
 // ─────────────────────────────────────────
 //  CRAWLER
@@ -404,31 +491,133 @@ app.get('/crawler/status', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────
+//  LOCALIZAÇÃO
+// ─────────────────────────────────────────
+
+function locFile(userId)   { return path.join(userDir(userId), 'location.json'); }
+function locPlaceFile(uid) { return path.join(userDir(uid),    'places.json'); }
+
+function readLoc(userId)    { return readJSON(locFile(userId),    { enabled: false, lat: null, lon: null, place: null, updatedAt: null }); }
+function readPlaces(userId) { return readJSON(locPlaceFile(userId), []); }
+
+// distância em metros entre dois pontos
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*r)*Math.cos(lat2*r)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// resolve o nome do lugar via Nominatim (sem chave)
+async function reverseGeocode(lat, lon) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=pt`;
+    const res  = await fetch(url, { headers: { 'User-Agent': 'MindApp/1.0' } });
+    const data = await res.json();
+    const addr = data.address || {};
+    return addr.road || addr.suburb || addr.neighbourhood || addr.city || addr.town || 'lugar desconhecido';
+  } catch { return null; }
+}
+
+// detecta o tipo do lugar atual baseado nos lugares salvos
+function detectPlaceType(userId, lat, lon) {
+  if (!lat || !lon) return 'unknown';
+  const places = readPlaces(userId);
+  const RADIUS = 200; // metros
+  for (const p of places) {
+    if (haversine(lat, lon, p.lat, p.lon) <= RADIUS) return p.type;
+  }
+  // detecta hora — madrugada = dormindo
+  const hour = new Date().getHours();
+  if (hour >= 0 && hour < 7) return 'sleeping';
+  return 'unknown';
+}
+
+// POST /location — frontend manda coords a cada 5min
+app.post('/location', requireAuth, async (req, res) => {
+  const { lat, lon, enabled } = req.body;
+  const loc = readLoc(req.user.id);
+
+  if (!enabled) {
+    writeJSON(locFile(req.user.id), { ...loc, enabled: false });
+    return res.json({ ok: true });
+  }
+
+  let placeName = null;
+  if (lat && lon) {
+    placeName = await reverseGeocode(lat, lon);
+    writeJSON(locFile(req.user.id), {
+      enabled: true, lat, lon,
+      place:     placeName,
+      type:      detectPlaceType(req.user.id, lat, lon),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  res.json({ ok: true, place: placeName });
+});
+
+// GET /location/places
+app.get('/location/places', requireAuth, (req, res) => {
+  res.json(readPlaces(req.user.id));
+});
+
+// POST /location/places — salva um lugar
+app.post('/location/places', requireAuth, (req, res) => {
+  const { lat, lon, name, type } = req.body;
+  if (!lat || !lon || !name) return res.status(400).json({ error: 'campos obrigatórios' });
+  const places = readPlaces(req.user.id);
+  places.push({ id: crypto.randomUUID(), lat, lon, name, type: type || 'other' });
+  writeJSON(locPlaceFile(req.user.id), places);
+  res.json({ ok: true });
+});
+
+// DELETE /location/places/:id
+app.delete('/location/places/:id', requireAuth, (req, res) => {
+  const places = readPlaces(req.user.id).filter(p => p.id !== req.params.id);
+  writeJSON(locPlaceFile(req.user.id), places);
+  res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────
 //  LOOP PROATIVO (verifica a cada 1h)
 // ─────────────────────────────────────────
 setInterval(async () => {
   const users = getUsers();
   for (const user of users) {
     try {
+      // checa localização antes de tudo
+      const loc  = readLoc(user.id);
+      const type = loc.enabled ? detectPlaceType(user.id, loc.lat, loc.lon) : 'unknown';
+
+      // silencia completamente em trabalho/escola ou madrugada
+      if (type === 'work' || type === 'sleeping') {
+        console.log(`[agent] silenciado para ${user.username} (${type})`);
+        continue;
+      }
+
       const msg = await checkProactive(USERS_DIR, user.id, user.username);
       if (!msg) continue;
 
       console.log(`[agent] proativo para ${user.username}: ${msg}`);
 
-      // 1. Envia push notification
+      // em lugar desconhecido ou academia — só push, sem injetar na conversa
+      if (type === 'unknown' || type === 'gym') {
+        await sendPush(user.id, 'Mind 🧠', msg).catch(() => {});
+        continue;
+      }
+
+      // em casa (home) ou outro lugar normal — push + injeta na conversa
       await sendPush(user.id, 'Mind 🧠', msg).catch(() => {});
 
-      // 2. Injeta a msg numa conversa
-      const convs = getConvs(user.id);
-      const time  = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      const convs   = getConvs(user.id);
+      const time    = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
       const mindMsg = { role: 'mind', text: msg, time, proactive: true };
 
       if (convs.length > 0) {
-        // usa a conversa mais recente
         convs[0].messages.push(mindMsg);
         convs[0].atualizadoEm = new Date().toISOString();
       } else {
-        // cria conversa nova
         convs.unshift({
           id:           crypto.randomUUID(),
           titulo:       'Mind entrou em contato',
@@ -437,7 +626,6 @@ setInterval(async () => {
           messages:     [mindMsg],
         });
       }
-
       saveConvs(user.id, convs);
 
     } catch (e) {
