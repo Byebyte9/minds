@@ -13,6 +13,9 @@ import { buildSystemPrompt, checkProactive }                 from './core/agent.
 import { startCrawl, stopCrawl, isCrawling }                 from './crawler/crawler.js';
 import { initReminders, extractReminder }                    from './core/reminders.js';
 import { webSearch, formatSearchResults }                    from './core/search.js';
+import Groq from 'groq-sdk';
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app       = express();
