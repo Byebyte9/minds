@@ -306,15 +306,56 @@ const SEARCH_TOOL = {
     parameters: {
       type: 'object',
       properties: {
-        query: {
-          type: 'string',
-          description: 'Termo de busca em português ou inglês',
-        },
+        query: { type: 'string', description: 'Termo de busca em português ou inglês' },
       },
       required: ['query'],
     },
   },
 };
+
+const NEARBY_TOOL = {
+  type: 'function',
+  function: {
+    name: 'nearby_search',
+    description: 'Busca lugares próximos à localização atual do usuário (restaurantes, padarias, farmácias, etc). Use quando o usuário perguntar sobre lugares perto dele.',
+    parameters: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', description: 'Tipo do lugar em inglês: bakery, restaurant, pharmacy, supermarket, hospital, bank, gas_station, gym, etc' },
+        keyword: { type: 'string', description: 'Palavra-chave opcional pra refinar (ex: lanchonete, pizza)' },
+        radius: { type: 'number', description: 'Raio em metros (padrão 1000)' },
+      },
+      required: ['type'],
+    },
+  },
+};
+
+async function nearbySearch(lat, lon, type, keyword = '', radius = 1000) {
+  try {
+    // Overpass API — busca no OpenStreetMap
+    const tag   = `amenity=${type}`;
+    const query = `[out:json][timeout:10];(node[${tag}](around:${radius},${lat},${lon});way[${tag}](around:${radius},${lat},${lon}););out center 8;`;
+    const res   = await fetch('https://overpass-api.de/api/interpreter', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    `data=${encodeURIComponent(query)}`,
+    });
+    const data = await res.json();
+    const elements = (data.elements || []).slice(0, 6);
+    if (!elements.length) return 'Nenhum lugar encontrado próximo.';
+
+    return elements.map(e => {
+      const name = e.tags?.name || 'Sem nome';
+      const addr = [e.tags?.['addr:street'], e.tags?.['addr:housenumber']].filter(Boolean).join(', ');
+      const lat2 = e.lat || e.center?.lat;
+      const lon2 = e.lon || e.center?.lon;
+      const mapsUrl = lat2 ? `https://maps.google.com/?q=${lat2},${lon2}` : '';
+      return `• ${name}${addr ? ' — ' + addr : ''}${mapsUrl ? '\n  ' + mapsUrl : ''}`;
+    }).join('\n');
+  } catch (e) {
+    return 'Não consegui buscar lugares próximos agora.';
+  }
+}
 
 app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
   const convs = getConvs(req.user.id);
@@ -340,8 +381,14 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
   }
 
   // Monta system prompt com memórias
-  const memCtx    = memoriesAsContext(USERS_DIR, req.user.id);
-  const sysPrompt = buildSystemPrompt(req.user.username, memCtx);
+  const memCtx = memoriesAsContext(USERS_DIR, req.user.id);
+  const loc    = readLoc(req.user.id);
+  const locCtx = loc.enabled && loc.lat ? {
+    label: loc.place || 'desconhecida',
+    lat:   loc.lat,
+    lon:   loc.lon,
+  } : null;
+  const sysPrompt = buildSystemPrompt(req.user.username, memCtx, locCtx);
 
   const groqMsgs = [
     { role: 'system', content: sysPrompt },
@@ -361,11 +408,14 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
     res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`);
 
   try {
-    // Primeira chamada — com tool disponível
+    // Primeira chamada — com ferramentas disponíveis
+    const tools = [SEARCH_TOOL];
+    if (locCtx) tools.push(NEARBY_TOOL); // só oferece busca próxima se tem localização
+
     const firstCall = await groq.chat.completions.create({
       model:       'llama-3.3-70b-versatile',
       messages:    groqMsgs,
-      tools:       [SEARCH_TOOL],
+      tools,
       tool_choice: 'auto',
       max_tokens:  1024,
       temperature: 0.85,
@@ -373,16 +423,26 @@ app.post('/conversations/:id/chat', requireAuth, async (req, res) => {
 
     const firstChoice = firstCall.choices[0];
 
-    // Modelo quer usar a busca
     if (firstChoice.finish_reason === 'tool_calls') {
       const toolCall = firstChoice.message.tool_calls[0];
-      const { query } = JSON.parse(toolCall.function.arguments);
+      const args     = JSON.parse(toolCall.function.arguments);
+      let   resultText;
 
-      console.log(`[search] buscando: "${query}"`);
-      send('status', { text: `🔍 pesquisando "${query}"...` });
+      if (toolCall.function.name === 'nearby_search') {
+        if (!locCtx) {
+          resultText = 'Localização não disponível.';
+        } else {
+          send('status', { text: `📍 buscando ${args.keyword || args.type} próximo...` });
+          resultText = await nearbySearch(locCtx.lat, locCtx.lon, args.type, args.keyword, args.radius || 1000);
+        }
+      } else {
+        // web_search
+        send('status', { text: `🔍 pesquisando "${args.query}"...` });
+        const results = await webSearch(args.query);
+        resultText    = formatSearchResults(results);
+      }
 
-      const results     = await webSearch(query);
-      const resultText  = formatSearchResults(results);
+      console.log(`[tool] ${toolCall.function.name}:`, args);
 
       // Segunda chamada — com resultado da busca, agora em streaming
       const msgsComBusca = [
