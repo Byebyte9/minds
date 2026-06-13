@@ -602,7 +602,11 @@ async function reverseGeocode(lat, lon) {
     const data = await res.json();
     console.log(`[geocode] resultado:`, JSON.stringify(data.address || data.error));
     const addr = data.address || {};
-    return addr.road || addr.suburb || addr.neighbourhood || addr.city_district || addr.city || addr.town || 'lugar desconhecido';
+    const bairro  = addr.neighbourhood || addr.quarter || addr.suburb || '';
+    const cidade  = addr.town || addr.city || addr.city_district || '';
+    const estado  = addr.state || '';
+    const partes  = [bairro, cidade, estado].filter(Boolean);
+    return partes.join(', ') || 'lugar desconhecido';
   } catch (e) { console.error('[geocode] erro:', e.message); return null; }
 }
 
